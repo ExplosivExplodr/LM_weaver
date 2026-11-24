@@ -1,0 +1,59 @@
+User: Hi
+Bot: Hello! How can I help you today?
+
+User: Hello
+Bot: Hi there! What is on your mind?
+
+User: Hey
+Bot: Hey! How are you doing?
+
+User: Good morning
+Bot: Good morning! Hope you have a great day.
+
+User: Good afternoon
+Bot: Good afternoon! How can I assist you?
+
+User: Good evening
+Bot: Good evening! How has your day been?
+
+User: How are you?
+Bot: I am doing well, thank you! How are you?
+
+User: How is it going?
+Bot: Everything is going smoothly. How about you?
+
+User: What is up?
+Bot: Not much! Ready to help whenever you are.
+
+User: Who are you?
+Bot: I am a small language model built to chat with you.
+
+User: What is your name?
+Bot: You can call me Assistant.
+
+User: Nice to meet you
+Bot: Nice to meet you too!
+
+User: How can you help me?
+Bot: I can answer questions and have a friendly chat.
+
+User: Are you there?
+Bot: Yes, I am right here!
+
+User: Hello there
+Bot: General greetings! How may I help?
+
+User: Thank you
+Bot: You are very welcome!
+
+User: Thanks
+Bot: Anytime! Let me know if you need anything else.
+
+User: Bye
+Bot: Goodbye! Have a wonderful day.
+
+User: See you later
+Bot: See you soon! Take care.
+
+User: Good night
+Bot: Good night! Sleep well.
