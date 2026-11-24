@@ -1,7 +1,3 @@
-# ========================================== #
-#              AI MODEL TRAINER              #
-#              MADE BY EXPLODER              #
-# ========================================== #
 import os
 import random
 
@@ -22,6 +18,9 @@ block_size = 64
 n_embd = 128
 n_head = 4
 n_layer = 4
+
+# Pin the seed so the shuffling below (and every other random draw) is reproducible.
+torch.manual_seed(1337)
 
 
 class Head(nn.Module):
@@ -109,7 +108,7 @@ if not os.path.exists(data_filename):
     print(
         "Please create a text file named 'train_data.txt' and place your data inside."
     )
-    exit()
+    raise SystemExit(1)
 
 with open(data_filename, "r", encoding="utf-8") as f:
     raw_text = f.read().strip()
@@ -118,7 +117,8 @@ if len(raw_text) <= block_size:
     print(
         "\nCRITICAL ERROR: Your 'train_data.txt' file is empty or too short to analyze."
     )
-    exit()
+    print(f"It needs more than {block_size} characters to build a training batch.")
+    raise SystemExit(1)
 
 # Split text entries cleanly and shuffle to expand dataset context variations
 base_turns = raw_text.split("\n\n")
@@ -137,16 +137,39 @@ encode = lambda s: [stoi[c] for c in s if c in stoi]
 
 data = torch.tensor(encode(rpg_data), dtype=torch.long)
 
+# Hold out the last 10% of the corpus so we can report a loss the model never
+# trained on. It catches overfitting that the training loss alone would hide.
+n_split = int(0.9 * len(data))
+train_data, val_data = data[:n_split], data[n_split:]
+
 model = ScratchLanguageModel(vocab_size)
 m = model.to(device)
 optimizer = torch.optim.AdamW(m.parameters(), lr=5e-4)
 
 
-def get_batch():
-    ix = torch.randint(len(data) - block_size, (32,))
-    x = torch.stack([data[i : i + block_size] for i in ix])
-    y = torch.stack([data[i + 1 : i + block_size + 1] for i in ix])
+def get_batch(split="train"):
+    source = train_data if split == "train" else val_data
+    # Guard against corpora that are only a few blocks long.
+    max_start = max(len(source) - block_size, 1)
+    ix = torch.randint(max_start, (32,))
+    x = torch.stack([source[i : i + block_size] for i in ix])
+    y = torch.stack([source[i + 1 : i + block_size + 1] for i in ix])
     return x.to(device), y.to(device)
+
+
+@torch.no_grad()
+def estimate_loss(eval_iters=20):
+    m.eval()
+    out = {}
+    for split in ("train", "val"):
+        losses = torch.zeros(eval_iters)
+        for i in range(eval_iters):
+            xb, yb = get_batch(split)
+            _, loss = m(xb, yb)
+            losses[i] = loss.item()
+        out[split] = losses.mean().item()
+    m.train()
+    return out
 
 
 # OPTIMIZATION LOOP
@@ -155,15 +178,19 @@ def get_batch():
 training_steps = 5000
 print("\nSTAGE 2: INITIATING REAL-TIME OPTIMIZATION LOOP...")
 for step in range(training_steps):
-    xb, yb = get_batch()
+    xb, yb = get_batch("train")
     logits, loss = m(xb, yb)
 
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
 
-    if step % 250 == 0:
-        print(f"STEP {step:4d} | LEARNING LOSS = {loss.item():.4f}")
+    if step % 250 == 0 or step == training_steps - 1:
+        stats = estimate_loss()
+        print(
+            f"STEP {step:4d} | TRAIN LOSS = {stats['train']:.4f} "
+            f"| VAL LOSS = {stats['val']:.4f}"
+        )
 
 #  EXPORT COMPILED BUNDLE
 try:
@@ -189,8 +216,23 @@ try:
 except TimeoutOccurred:
     print("\nTIME IS UP!!! INITIATING DEFAULT NAME...")
     chosen_name = default_name
+except (EOFError, KeyboardInterrupt):
+    # No interactive terminal (CI, piped stdin, Ctrl+C) -> fall back to default.
+    print("\nNO INPUT RECEIVED. INITIATING DEFAULT NAME...")
+    chosen_name = default_name
 
-checkpoint = {"model_state_dict": m.state_dict(), "chars_mapping": chars}
+# Store the architecture alongside the weights so loader.py can rebuild the
+# exact model even if the defaults below are changed later.
+checkpoint = {
+    "model_state_dict": m.state_dict(),
+    "chars_mapping": chars,
+    "config": {
+        "block_size": block_size,
+        "n_embd": n_embd,
+        "n_head": n_head,
+        "n_layer": n_layer,
+    },
+}
 
 torch.save(checkpoint, chosen_name)
 print(f"MODEL TRAINING SUCCESS: MODEL BUNDLE SAVED AS '{chosen_name}'")

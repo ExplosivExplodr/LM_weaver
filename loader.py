@@ -1,7 +1,3 @@
-# ========================================== #
-#              LM MODEL LOADER               #
-#              MADE BY EXPLODER              #
-# ========================================== #
 import os
 
 import torch
@@ -94,11 +90,15 @@ class ScratchLanguageModel(nn.Module):
         return self.lm_head(self.ln_f(self.blocks(x))), None
 
 
-default_load_name = "H.O.R.C.-1m.pth"
+default_load_name = "model.pth"
 print("\nLOADING MODEL STAGE:")
-user_model_name = input(
-    f"Enter model file path (Press Enter for default '{default_load_name}'): "
-).strip()
+try:
+    user_model_name = input(
+        f"Enter model file path (Press Enter for default '{default_load_name}'): "
+    ).strip()
+except (EOFError, KeyboardInterrupt):
+    # No interactive terminal (piped stdin, CI) -> fall back to default model.
+    user_model_name = ""
 
 if not user_model_name:
     user_model_name = default_load_name
@@ -107,10 +107,23 @@ if not os.path.exists(user_model_name):
     print(f"ERROR: Checkpoint file '{user_model_name}' not found!")
 else:
     print(f"Extracting weights from '{user_model_name}'...")
-    checkpoint = torch.load(user_model_name, map_location=device)
+    try:
+        checkpoint = torch.load(user_model_name, map_location=device, weights_only=True)
+    except TypeError:
+        # weights_only was added in torch 2.0; older versions don't accept it.
+        checkpoint = torch.load(user_model_name, map_location=device)
 
     chars = checkpoint["chars_mapping"]
     vocab_size = len(chars)
+
+    # Newer checkpoints carry their architecture; older ones fall back to defaults.
+    config = checkpoint.get("config", {})
+    block_size = config.get("block_size", block_size)
+    n_embd = config.get("n_embd", n_embd)
+    n_head = config.get("n_head", n_head)
+    n_layer = config.get("n_layer", n_layer)
+    if not config:
+        print("(Legacy checkpoint: using default architecture settings.)")
 
     stoi = {ch: i for i, ch in enumerate(chars)}
     itos = {i: ch for i, ch in enumerate(chars)}
@@ -127,10 +140,18 @@ else:
 
     chat_history = ""
     while True:
-        user_input = input("You: ")
+        try:
+            user_input = input("You: ")
+        except (EOFError, KeyboardInterrupt):
+            # Ctrl+D / Ctrl+C ends the session cleanly instead of a traceback.
+            print("\nSession ended")
+            break
+
         if user_input.lower() == "exit":
             print("Session ended")
             break
+        if not user_input.strip():
+            continue
 
         current_turn = f"User: {user_input}\nBot:"
         chat_history += current_turn
@@ -138,6 +159,7 @@ else:
         bot_response = ""
 
         for _ in range(250):
+            # Keep the context within one block; the model has no longer memory.
             constrained_text = chat_history[-block_size:]
             context = torch.tensor(
                 [encode(constrained_text)], dtype=torch.long, device=device
@@ -150,8 +172,12 @@ else:
             next_token = torch.multinomial(probs, num_samples=1)
             predicted_char = decode([next_token.item()])
 
-            if predicted_char == "\n" and len(bot_response) > 5:
-                break
+            # A newline right after "Bot:" is an empty reply; a blank line
+            # means the bot has started a new turn. Either way we are done.
+            if predicted_char == "\n":
+                if "\n\n" in bot_response or len(bot_response) > 5:
+                    break
+                continue
 
             print(predicted_char, end="", flush=True)
             bot_response += predicted_char
