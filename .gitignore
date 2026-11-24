@@ -1,0 +1,8 @@
+# Trained model checkpoints (binary, regenerate with trainer.py)
+*.pth
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
