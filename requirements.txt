@@ -1,0 +1,8 @@
+torch
+
+# Optional: adds a 45-second countdown to the trainer's save prompt.
+# Without it, the trainer asks for a name and waits for input instead.
+inputimeout
+
+# Optional: enables --hf-dataset (train straight from the Hugging Face Hub).
+datasets

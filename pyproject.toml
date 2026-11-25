@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lm-weaver"
+version = "1.0.0"
+description = "A small transformer language model, trained from scratch"
+readme = "readme.md"
+requires-python = ">=3.9"
+dependencies = ["torch"]
+
+[project.optional-dependencies]
+# 45-second countdown on the trainer's "name your model" prompt
+interactive = ["inputimeout"]
+# enables --hf-dataset
+hf = ["datasets"]
+dev = ["pytest"]
+
+[project.scripts]
+lm-weaver = "lm_weaver.__main__:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["src/lm_weaver"]
