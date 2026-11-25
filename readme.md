@@ -57,6 +57,11 @@ Flags: `--hf-config` (subset name), `--hf-split` (default `train`),
 `--hf-max-examples` (stop after N conversations). `--hf-dataset` also accepts a
 local `.jsonl` file with one conversation per line.
 
+`--hf-config` is **required for datasets that bundle several subsets** --
+`smoltalk` ships 14, so a bare `--hf-dataset HuggingFaceTB/smoltalk` cannot
+pick one and the trainer will stop and list the valid names. Single-subset
+datasets such as `HuggingFaceH4/ultrachat_200k` work without it.
+
 Note: HF datasets are far larger than `train_data.txt`. `--hf-max-examples`
 controls how much you take, and a preset that is fine for 20 exchanges will be
 heavily undertrained on 300 -- use `--preset base` or `big` and a few thousand

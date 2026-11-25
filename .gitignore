@@ -1,8 +1,19 @@
 # Trained model checkpoints (binary, regenerate with trainer.py)
 *.pth
+*.pt
+# ...except the example model, which is meant to be shipped
+!example.pth
 
 # Python
 __pycache__/
 *.py[cod]
 .venv/
 venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Scratch commit message file (git commit -F COMMIT_MSG.txt)
+COMMIT_MSG.txt
+.COMMIT_MSG.txt

@@ -1,5 +1,5 @@
-"""Tests for the shared model definition. Runs with pytest or plain python3.
-
+# Tests for the shared model definition. Runs with pytest or plain python3.
+"""
     python3 -m pytest test_model.py -q
     python3 test_model.py
 """
@@ -9,6 +9,7 @@ import unittest
 import torch
 from torch.nn import functional as F
 
+from . import hf_data
 from .hf_data import example_to_text
 from .model import (
     AppConfig,
@@ -65,7 +66,7 @@ class TestForward(unittest.TestCase):
         self.assertAlmostEqual(loss.item(), uniform, delta=0.1)
 
     def test_causality_no_peeking(self):
-        """Changing the last token must not alter earlier positions."""
+        # Changing the last token must not alter earlier positions.
         self.model.eval()
         a = torch.randint(0, TINY.vocab_size, (1, 16))
         b = a.clone()
@@ -135,7 +136,7 @@ class TestGenerate(unittest.TestCase):
         self.assertTrue(torch.equal(greedy, top1))
 
     def test_top_k_zero_means_disabled(self):
-        """top_k=0 is the saved default for "no filtering"; topk(0) would crash."""
+        # top_k=0 is the saved default for "no filtering"; topk(0) would crash.
         out = self.model.generate(self.start, 5, temperature=0.8, top_k=0)
         self.assertEqual(out.shape[1], self.start.shape[1] + 5)
 
@@ -193,7 +194,7 @@ class TestCheckpoint(unittest.TestCase):
         self.assertEqual(CharTokenizer(loaded["chars_mapping"]).chars, tokens.chars)
 
 class TestBlockWiring(unittest.TestCase):
-    """Regression tests for the residual stream wiring inside a Block."""
+    # Regression tests for the residual stream wiring inside a Block.
 
     def setUp(self):
         torch.manual_seed(0)
@@ -224,7 +225,7 @@ class TestBlockWiring(unittest.TestCase):
         self.assertFalse(torch.allclose(actual, naive, atol=1e-4))
 
 class TestLegacyCompatibility(unittest.TestCase):
-    """An old-architecture config must reproduce the old forward pass."""
+    # An old-architecture config must reproduce the old forward pass.
 
     def test_original_config_matches_reference_forward(self):
         config = TINY.replace(
@@ -349,6 +350,68 @@ class TestHFDatasetConversion(unittest.TestCase):
             }
         )
         self.assertNotIn("abracadabra", text)
+
+class TestHFConfigErrors(unittest.TestCase):
+    """A dataset with many subsets must say which --hf-config to pass.
+        These stub out the datasets module so no network access is needed.
+    """
+
+    class _FakeDatasets:
+        def __init__(self, configs, raises):
+            self.configs = configs
+            self.raises = raises
+
+        def get_dataset_config_names(self, name):
+            return self.configs
+
+        def load_dataset(self, path, **kwargs):
+            raise RuntimeError(self.raises)
+
+    MISSING = ("Config name is missing.\nPlease pick one among the available "
+               "configs: ['all', 'everyday-conversations']")
+
+    def test_missing_config_names_available_subsets(self):
+        fake = self._FakeDatasets(["all", "everyday-conversations"], self.MISSING)
+        with self.assertRaises(SystemExit) as caught:
+            hf_data._load_dataset(fake, "org/multi", None, "train", True)
+        message = str(caught.exception)
+        self.assertIn("--hf-config is required", message)
+        self.assertIn("everyday-conversations", message)
+        # Gives a command the user can paste as-is.
+        self.assertIn("--hf-config", message)
+
+    def test_typo_config_suggests_the_real_name(self):
+        fake = self._FakeDatasets(
+            ["all", "everyday-conversations"],
+            "BuilderConfig 'everyday-conversation' not found",
+        )
+        with self.assertRaises(SystemExit) as caught:
+            hf_data._load_dataset(fake, "org/multi", "everyday-conversation",
+                                  "train", True)
+        message = str(caught.exception)
+        self.assertIn("Did you mean 'everyday-conversations'?", message)
+
+    def test_config_passed_through_when_given(self):
+        class _Recorder:
+            def __init__(self):
+                self.received = {}
+
+            def load_dataset(self, path, **kwargs):
+                self.received = kwargs
+                return ["row"]
+
+        recorder = _Recorder()
+        hf_data._load_dataset(recorder, "org/ds", "my-config", "train_sft", True)
+        self.assertEqual(recorder.received["name"], "my-config")
+        self.assertEqual(recorder.received["split"], "train_sft")
+        self.assertTrue(recorder.received["streaming"])
+
+    def test_unrelated_error_keeps_generic_hint(self):
+        fake = self._FakeDatasets([], "Repository not found for url: ...")
+        with self.assertRaises(SystemExit) as caught:
+            hf_data._load_dataset(fake, "org/missing", None, "train", True)
+        self.assertIn("could not load dataset", str(caught.exception))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -16,6 +16,7 @@ Usage:
     python3 trainer.py --hf-dataset HuggingFaceH4/ultrachat_200k --hf-split train_sft
     python3 trainer.py --hf-dataset ./my_local.jsonl      # local file also works
 """
+import difflib
 import json
 
 # Role names used by different dataset families, mapped onto the two speakers.
@@ -121,6 +122,78 @@ def _dataset_hint(name, error):
     )
 
 
+def _pick_config_hint(configs, wanted=None):
+    """Suggest the closest config name for a typo, or None."""
+    if not configs:
+        return None
+    if wanted:
+        pool = configs
+        target = wanted.lower()
+        best = max(pool, key=lambda c: difflib.SequenceMatcher(
+            None, target, c.lower()).ratio())
+        return best
+    return configs[0]
+
+
+def _describe_missing_config(name, configs):
+    """A short, copy-pasteable error when a dataset needs a config name."""
+    shown = configs[:12]
+    more = f" (and {len(configs) - len(shown)} more)" if len(configs) > len(shown) else ""
+    suggestion = _pick_config_hint(configs)
+    return (
+        f"ERROR: {name!r} contains {len(configs)} subsets and has no default,\n"
+        "so --hf-config is required.\n\n"
+        f"Available: {', '.join(shown)}{more}\n\n"
+        f"Try:\n  python3 trainer.py --hf-dataset {name} "
+        f"--hf-config {suggestion}"
+    )
+
+
+def _describe_bad_config(name, configs, wanted):
+    """A short error when --hf-config doesn't exist (usually a typo)."""
+    suggestion = _pick_config_hint(configs, wanted)
+    hint = f"\nDid you mean {suggestion!r}?" if suggestion else ""
+    shown = ", ".join(configs[:12])
+    return (
+        f"ERROR: {name!r} has no subset called {wanted!r}.{hint}\n"
+        f"Available: {shown}"
+    )
+
+
+def _available_configs(datasets, name):
+    """Best-effort list of a dataset's config names; [] if unknown."""
+    try:
+        return list(datasets.get_dataset_config_names(name) or [])
+    except Exception:
+        return []
+
+
+def _load_dataset(datasets, name, config, split, streaming):
+    """Call load_dataset, turning Hub errors into actionable messages.
+
+    A dataset with a single default config works without --hf-config; one
+    with many configs (smoltalk) refuses to load until you name one, so we
+    look the list up and say which to pass instead of echoing Hub output.
+    """
+    kwargs = {"split": split, "streaming": streaming}
+    if config:
+        kwargs["name"] = config
+    try:
+        return datasets.load_dataset(name, **kwargs)
+    except Exception as error:
+        message = str(error)
+        # The Hub's own message for "you must choose a config".
+        needs_config = "Config name is missing" in message
+        if needs_config or ("BuilderConfig" in message and "not found" in message):
+            configs = _available_configs(datasets, name)
+            if config:
+                if configs:
+                    raise SystemExit(_describe_bad_config(name, configs, config))
+            elif configs:
+                raise SystemExit(_describe_missing_config(name, configs))
+        raise SystemExit(_dataset_hint(name, error))
+
+
 def load_hf_corpus(
     name,
     config=None,
@@ -130,14 +203,7 @@ def load_hf_corpus(
 ):
     """Download (or open) a dataset and return it as training text."""
     datasets = _import_datasets()
-    kwargs = {"split": split, "streaming": streaming}
-    if config:
-        kwargs["name"] = config
-
-    try:
-        dataset = datasets.load_dataset(name, **kwargs)
-    except Exception as error:
-        raise SystemExit(_dataset_hint(name, error))
+    dataset = _load_dataset(datasets, name, config, split, streaming)
 
     examples, skipped = [], 0
     for row in dataset:
