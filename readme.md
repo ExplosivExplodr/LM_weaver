@@ -115,9 +115,28 @@ python3 trainer.py --data my.txt --out run1.pth
 | small  |    349,484 |     96 |      4 |       3 |         64 |
 | base   |    811,308 |    128 |      4 |       4 |         64 |
 | big    |  4,789,804 |    256 |      8 |       6 |        128 |
+| modern | 25,253,376 |    512 |      8 |       8 |        512 |
 
-(Measured with this dataset's 44-character vocabulary; your numbers will differ
-slightly with a different corpus.)
+### The modern architecture
+
+`modern` turns on four opt-in switches that are each off by default:
+
+| flag | what it does |
+|------|--------------|
+| `--pos-emb rope` | RoPE instead of a learned position table; costs zero parameters and removes the hard `block_size` cap on learned positions |
+| `--fused-attention` | one QKV matmul + `scaled_dot_product_attention` (Flash-Attention when available) instead of `n_head` separate heads plus a `cat` |
+| `--mlp swiglu` | Llama-style gated MLP: `silu(xW1) * xW3` then `W2` |
+| `--qk-norm` | RMSNorm on q and k before attention; stabilises deep models (needs `--fused-attention`) |
+
+```bash
+python3 trainer.py --preset modern --steps 40000 --batch-size 64 \
+                   --no-bias --lr 6e-4 --warmup 1000
+```
+
+**All four default to the old behaviour**, so checkpoints trained before they
+existed (`example.pth`, `Model.pth`) still load and produce byte-identical
+output. They are only active when you ask for them, which also means a
+`--pos-emb rope` model cannot be resumed from an old checkpoint.
 
 Rules of thumb:
 

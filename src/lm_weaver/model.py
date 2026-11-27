@@ -36,6 +36,15 @@ class ModelConfig:
     tie_embeddings: bool = False
     act: str = "gelu"  # feedforward activation: "gelu" or "relu"
     residual_dropout: bool = False  # dropout on each residual add in a Block
+    # --- modern architecture switches -------------------------------------
+    # All of these default to the legacy behaviour so checkpoints trained
+    # before they existed (example.pth, multilayer-small.pt) still load and
+    # produce byte-identical output. Turn them on for new models only.
+    pos_emb: str = "learned"  # "learned" (absolute table) or "rope"
+    rope_base: float = 10000.0  # RoPE frequency base
+    fused_attention: bool = False  # one QKV matmul + scaled_dot_product_attention
+    mlp: str = "mlp"  # "mlp" (Linear-act-Linear) or "swiglu"
+    qk_norm: bool = False  # RMSNorm on q and k before attention, stabilises depth
 
     def __post_init__(self):
         if self.vocab_size < 1:
@@ -50,6 +59,22 @@ class ModelConfig:
             raise ValueError(f"n_layer must be >= 0, got {self.n_layer}")
         if self.act not in ("gelu", "relu"):
             raise ValueError(f"act must be 'gelu' or 'relu', got {self.act!r}")
+        if self.pos_emb not in ("learned", "rope"):
+            raise ValueError(f"pos_emb must be 'learned' or 'rope', got {self.pos_emb!r}")
+        if self.mlp not in ("mlp", "swiglu"):
+            raise ValueError(f"mlp must be 'mlp' or 'swiglu', got {self.mlp!r}")
+        if self.rope_base <= 0:
+            raise ValueError(f"rope_base must be > 0, got {self.rope_base}")
+        if self.pos_emb == "rope" and (self.n_embd // self.n_head) % 2 != 0:
+            # RoPE rotates pairs of dimensions within each head.
+            raise ValueError(
+                f"pos_emb='rope' needs an even head size, got "
+                f"{self.n_embd // self.n_head} (n_embd {self.n_embd}, "
+                f"n_head {self.n_head})"
+            )
+        if self.qk_norm and not self.fused_attention:
+            # The legacy per-head path has no place to apply it.
+            raise ValueError("qk_norm requires fused_attention=True")
 
     def replace(self, **changes):
         """Return a copy with some fields changed, re-validated."""
@@ -88,6 +113,54 @@ def make_layer_norm(config):
     if not config.bias:
         layer_norm.bias = None
     return layer_norm
+
+
+def build_rope_cache(block_size, head_size, base, device=None, dtype=torch.float32):
+    """Precompute cos/sin tables for rotary position embeddings.
+
+    Returns (cos, sin), each of shape (block_size, head_size // 2). Standard
+    RoPE: dimension pairs (2i, 2i+1) are rotated by an angle that grows with
+    position at a frequency that decays with i. This is computed once and
+    reused for every forward pass -- there is nothing to learn.
+    """
+    half = head_size // 2
+    # inv_freq[i] = base ** (-2i / head_size), the classic 1/tau_i schedule.
+    inv_freq = base ** (-torch.arange(half, device=device, dtype=torch.float32) * 2.0
+                         / head_size)
+    positions = torch.arange(block_size, device=device, dtype=torch.float32)
+    freqs = torch.outer(positions, inv_freq)  # (block_size, half)
+    return torch.cos(freqs).to(dtype), torch.sin(freqs).to(dtype)
+
+
+def apply_rope(x, cos, sin):
+    """Rotate a (B, n_head, T, head_size) tensor by the cached angles."""
+    T = x.size(-2)
+    cos = cos[:T].unsqueeze(0).unsqueeze(0)  # (1, 1, T, half)
+    sin = sin[:T].unsqueeze(0).unsqueeze(0)
+    # Split the last dim into even/odd elements: (..., half, 2) -> two views.
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
+    # The standard rotation, expressed on real tensors instead of complex ones.
+    rotated = torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
+    return rotated.flatten(-2)
+
+
+class RMSNorm(nn.Module):
+    """Root-mean-square LayerNorm: no mean subtraction, no bias.
+
+    Cheaper than LayerNorm and, with qk_norm, the usual modern choice for
+    keeping attention logits in a sane range at depth.
+    """
+
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        # Normalise by RMS only; the sign of the activations is preserved.
+        norm = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return norm * self.weight
 
 
 class Head(nn.Module):
@@ -149,14 +222,101 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 
+class FusedAttention(nn.Module):
+    """Multi-head attention as one QKV matmul plus fused SDPA.
+
+    Replaces n_head separate Heads + torch.cat. Mathematically equivalent to
+    MultiHeadAttention for the same weights, but it hits a single fused
+    kernel that Blackwell tensor cores handle far better, and it can consume
+    a Flash-Attention backend instead of materialising a T x T matrix.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.n_head = config.n_head
+        self.head_size = config.n_embd // config.n_head
+        # One projection producing q, k and v together: (n_embd -> 3 * n_embd).
+        self.qkv = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias_head)
+        self.proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.dropout_p = config.dropout
+        self.dropout = nn.Dropout(config.dropout)
+        self.qk_norm = config.qk_norm
+        if self.qk_norm:
+            # Separate norms per head dimension, applied before RoPE.
+            self.q_norm = RMSNorm(self.head_size)
+            self.k_norm = RMSNorm(self.head_size)
+        self.rope = config.pos_emb == "rope"
+        if self.rope:
+            # cos/sin are constants, not learned; registered so they follow
+            # the model to whatever device it lives on.
+            cos, sin = build_rope_cache(
+                config.block_size, self.head_size, config.rope_base
+            )
+            self.register_buffer("rope_cos", cos, persistent=False)
+            self.register_buffer("rope_sin", sin, persistent=False)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        # (B, T, 3C) -> (B, T, 3, n_head, head_size) -> three (B, n_head, T, hd).
+        qkv = self.qkv(x).view(B, T, 3, self.n_head, self.head_size)
+        q, k, v = qkv.unbind(dim=2)
+        q, k, v = (t.transpose(1, 2) for t in (q, k, v))
+
+        if self.qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+        if self.rope:
+            q = apply_rope(q, self.rope_cos, self.rope_sin)
+            k = apply_rope(k, self.rope_cos, self.rope_sin)
+
+        # is_causal builds the triangular mask inside the kernel, so no
+        # block_size x block_size tensor is allocated here.
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.dropout_p if self.training else 0.0,
+            is_causal=True,
+        )
+        out = out.transpose(1, 2).reshape(B, T, C)
+        return self.dropout(self.proj(out))
+
+
+class SwiGLU(nn.Module):
+    """Gated feedforward: (Swish(xW1) * xW3) W2.
+
+    Same parameter count as a 4x MLP when the hidden width is set to 8/3 x
+    n_embd, but the multiplicative gate gives noticeably better quality per
+    parameter. This is the MLP used by Llama-class models.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        hidden = int(8 * config.n_embd / 3)
+        # Round up to a multiple of 8 for tensor-core friendly shapes.
+        hidden = 8 * ((hidden + 7) // 8)
+        self.w1 = nn.Linear(config.n_embd, hidden, bias=False)  # gate path
+        self.w3 = nn.Linear(config.n_embd, hidden, bias=False)  # value path
+        self.w2 = nn.Linear(hidden, config.n_embd, bias=False)  # down projection
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
+
+
 class Block(nn.Module):
     """Pre-norm transformer block: attention then feedforward, both residual."""
 
     def __init__(self, config):
         super().__init__()
         self.residual_dropout = config.residual_dropout
-        self.sa = MultiHeadAttention(config)
-        self.ffwd = FeedForward(config)
+        # Choose attention and MLP implementations once, at build time.
+        if config.fused_attention:
+            self.sa = FusedAttention(config)
+        else:
+            self.sa = MultiHeadAttention(config)
+        if config.mlp == "swiglu":
+            self.ffwd = SwiGLU(config)
+        else:
+            self.ffwd = FeedForward(config)
         self.ln1 = make_layer_norm(config)
         self.ln2 = make_layer_norm(config)
         # A separate dropout on the residual adds (as in the original model).
@@ -194,7 +354,11 @@ class ScratchLanguageModel(nn.Module):
         super().__init__()
         self.config = config
         self.token_embedding_table = nn.Embedding(config.vocab_size, config.n_embd)
-        self.position_embedding_table = nn.Embedding(config.block_size, config.n_embd)
+        # With RoPE the positions are rotated into q/k instead, so the learned
+        # absolute table is not built at all -- that is the whole parameter win.
+        self.use_rope = config.pos_emb == "rope"
+        if not self.use_rope:
+            self.position_embedding_table = nn.Embedding(config.block_size, config.n_embd)
         self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layer)])
         self.ln_f = make_layer_norm(config)
         if config.tie_embeddings:
@@ -207,10 +371,14 @@ class ScratchLanguageModel(nn.Module):
 
         self.apply(self._init_weights)
         # GPT-2 trick: scale down residual projections so the residual stream
-        # does not blow up as depth increases.
+        # does not blow up as depth increases. Match parameter names by suffix
+        # rather than one exact string, because the legacy MLP (ffwd.net.2) and
+        # SwiGLU (ffwd.w2) name their output layer differently -- a single
+        # name check would silently skip SwiGLU and destabilise deep models.
         std = 0.02 / math.sqrt(2 * max(config.n_layer, 1))
+        residual_suffixes = ("sa.proj.weight", "ffwd.net.2.weight", "ffwd.w2.weight")
         for name, param in self.named_parameters():
-            if name.endswith("proj.weight") or name.endswith("ffwd.net.2.weight"):
+            if name.endswith(residual_suffixes):
                 nn.init.normal_(param, mean=0.0, std=std)
 
     def _init_weights(self, module):
@@ -232,9 +400,9 @@ class ScratchLanguageModel(nn.Module):
             raise ValueError(
                 f"sequence length {T} exceeds block_size {self.config.block_size}"
             )
-        x = self.token_embedding_table(idx) + self.position_embedding_table(
-            torch.arange(T, device=idx.device)
-        )
+        x = self.token_embedding_table(idx)
+        if not self.use_rope:
+            x = x + self.position_embedding_table(torch.arange(T, device=idx.device))
         logits = self.lm_head(self.ln_f(self.blocks(x)))
         loss = None
         if targets is not None:

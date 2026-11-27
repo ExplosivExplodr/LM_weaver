@@ -44,6 +44,14 @@ PRESETS = {
     "small": ModelConfig(n_embd=96, n_head=4, n_layer=3, block_size=64),
     "base": ModelConfig(n_embd=128, n_head=4, n_layer=4, block_size=64),
     "big": ModelConfig(n_embd=256, n_head=8, n_layer=6, block_size=128),
+    # The modern architecture: RoPE + fused SDPA + SwiGLU + qk_norm, no biases.
+    # ~25M params. This is the sane ceiling for a *character-level* model --
+    # 135M only makes sense after switching to subword tokens.
+    "modern": ModelConfig(
+        n_embd=512, n_head=8, n_layer=8, block_size=512,
+        dropout=0.0, bias=False, bias_head=False, bias_head_out=False,
+        pos_emb="rope", fused_attention=True, mlp="swiglu", qk_norm=True,
+    ),
 }
 
 
@@ -72,6 +80,19 @@ def parse_args():
     arch.add_argument("--n-head", type=int)
     arch.add_argument("--n-layer", type=int)
     arch.add_argument("--dropout", type=float)
+
+    modern = parser.add_argument_group(
+        "modern architecture (all off by default; old checkpoints keep working)"
+    )
+    modern.add_argument("--pos-emb", choices=["learned", "rope"],
+                        help="'rope' drops the learned position table entirely")
+    modern.add_argument("--rope-base", type=float, help="RoPE frequency base")
+    modern.add_argument("--fused-attention", action="store_true",
+                        help="one QKV matmul + scaled_dot_product_attention")
+    modern.add_argument("--mlp", choices=["mlp", "swiglu"],
+                        help="'swiglu' is the Llama-style gated MLP")
+    modern.add_argument("--qk-norm", action="store_true",
+                        help="RMSNorm q/k before attention; needs --fused-attention")
 
     train = parser.add_argument_group("training")
     train.add_argument("--lr", type=float)
@@ -122,6 +143,20 @@ def build_configs(args):
     )
     if args.no_bias:
         model_config = model_config.replace(bias=False)
+    # Modern switches. `True` is only applied when the user asked for it, and
+    # `--pos-emb`/`--mlp` only when given, so presets keep their own defaults.
+    modern_changes = {
+        "pos_emb": args.pos_emb,
+        "rope_base": args.rope_base,
+        "mlp": args.mlp,
+    }
+    model_config = model_config.replace(
+        **{k: v for k, v in modern_changes.items() if v is not None}
+    )
+    if args.fused_attention:
+        model_config = model_config.replace(fused_attention=True)
+    if args.qk_norm:
+        model_config = model_config.replace(qk_norm=True)
     app_config = AppConfig().replace(
         **{k: v for k, v in app_changes.items() if v is not None}
     )

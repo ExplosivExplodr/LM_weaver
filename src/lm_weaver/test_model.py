@@ -413,5 +413,120 @@ class TestHFConfigErrors(unittest.TestCase):
         self.assertIn("could not load dataset", str(caught.exception))
 
 
+class TestModernArchitecture(unittest.TestCase):
+    """The opt-in switches must not disturb the legacy behaviour."""
+
+    MODERN = TINY.replace(
+        pos_emb="rope", fused_attention=True, mlp="swiglu", qk_norm=True,
+    )
+
+    def test_defaults_stay_legacy(self):
+        # A config built with no explicit switches must reproduce the original
+        # architecture, or old checkpoints would stop loading.
+        self.assertEqual(TINY.pos_emb, "learned")
+        self.assertFalse(TINY.fused_attention)
+        self.assertEqual(TINY.mlp, "mlp")
+        self.assertFalse(TINY.qk_norm)
+
+    def test_legacy_config_keeps_position_table(self):
+        state = ScratchLanguageModel(TINY).state_dict()
+        self.assertIn("position_embedding_table.weight", state)
+
+    def test_rope_drops_position_table(self):
+        state = ScratchLanguageModel(self.MODERN).state_dict()
+        self.assertNotIn("position_embedding_table.weight", state)
+
+    def test_rope_removes_no_learnable_params_for_positions(self):
+        learned = ScratchLanguageModel(TINY).num_parameters()
+        rope = ScratchLanguageModel(
+            TINY.replace(pos_emb="rope")
+        ).num_parameters()
+        self.assertEqual(learned - rope, TINY.block_size * TINY.n_embd)
+
+    def test_modern_forward_and_backward_run(self):
+        torch.manual_seed(0)
+        model = ScratchLanguageModel(self.MODERN)
+        idx = torch.randint(0, TINY.vocab_size, (2, TINY.block_size))
+        logits, loss = model(idx, idx)
+        self.assertEqual(logits.shape, (2, TINY.block_size, TINY.vocab_size))
+        loss.backward()
+        self.assertTrue(all(p.grad is not None for p in model.parameters()))
+
+    def test_rope_is_shift_invariant(self):
+        # Attention scores must depend only on the offset between positions.
+        from .model import apply_rope, build_rope_cache
+
+        cos, sin = build_rope_cache(64, 8, 10000.0)
+        q = torch.randn(1, 1, 1, 8)
+        k = torch.randn(1, 1, 1, 8)
+
+        def score_at(pos):
+            zq = torch.cat([torch.zeros(1, 1, pos, 8), q, torch.zeros(1, 1, 1, 8)], 2)
+            zk = torch.cat([torch.zeros(1, 1, pos + 1, 8), k], 2)
+            rq = apply_rope(zq, cos, sin)[:, :, pos:pos + 1]
+            rk = apply_rope(zk, cos, sin)[:, :, pos + 1:pos + 2]
+            return (rq * rk).sum().item()
+
+        self.assertAlmostEqual(score_at(0), score_at(20), places=4)
+
+    def test_rope_preserves_norm(self):
+        from .model import apply_rope, build_rope_cache
+
+        cos, sin = build_rope_cache(32, 8, 10000.0)
+        x = torch.randn(1, 1, 32, 8)
+        self.assertTrue(
+            torch.allclose(x.norm(dim=-1), apply_rope(x, cos, sin).norm(dim=-1),
+                           atol=1e-5)
+        )
+
+    def test_fused_attention_matches_legacy_when_weights_copied(self):
+        # Same maths, different layout: this is the test that would catch a
+        # transposed reshape in the QKV split.
+        from .model import FusedAttention, MultiHeadAttention
+
+        torch.manual_seed(0)
+        cfg = TINY.replace(dropout=0.0, bias=False)
+        legacy = MultiHeadAttention(cfg).eval()
+        fused = FusedAttention(cfg.replace(fused_attention=True)).eval()
+        head_size = cfg.n_embd // cfg.n_head
+        with torch.no_grad():
+            for h, head in enumerate(legacy.heads):
+                for i, proj in enumerate((head.query, head.key, head.value)):
+                    start = i * cfg.n_embd + h * head_size
+                    fused.qkv.weight[start:start + head_size] = proj.weight
+            fused.proj.weight.copy_(legacy.proj.weight)
+
+        x = torch.randn(2, cfg.block_size, cfg.n_embd)
+        with torch.no_grad():
+            self.assertTrue(torch.allclose(legacy(x), fused(x), atol=1e-5))
+
+    def test_rejects_odd_head_size_with_rope(self):
+        with self.assertRaises(ValueError):
+            # 32 / 4 = 8 is even; 32 / 3 does not divide, so use n_head that
+            # gives an odd head size: 30 / 2 = 15.
+            ModelConfig(n_embd=30, n_head=2, pos_emb="rope")
+
+    def test_qk_norm_requires_fused_attention(self):
+        with self.assertRaises(ValueError):
+            TINY.replace(qk_norm=True)
+
+    def test_rejects_unknown_pos_emb(self):
+        with self.assertRaises(ValueError):
+            TINY.replace(pos_emb="alibi")
+
+    def test_rejects_unknown_mlp(self):
+        with self.assertRaises(ValueError):
+            TINY.replace(mlp="geglu")
+
+    def test_swiglu_gets_residual_scaling_init(self):
+        # Guards the bug where a name-based init silently skipped SwiGLU's w2
+        # and left deep models unstable.
+        torch.manual_seed(0)
+        model = ScratchLanguageModel(self.MODERN)
+        w2_std = model.blocks[0].ffwd.w2.weight.std().item()
+        w1_std = model.blocks[0].ffwd.w1.weight.std().item()
+        self.assertLess(w2_std, w1_std)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
